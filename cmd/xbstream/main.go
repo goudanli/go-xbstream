@@ -50,13 +50,9 @@ func init() {
 	log.SetOutput(os.Stderr)
 }
 
-func createAWSClient() *s3.S3 {
+func createAWSClient(endpoint, accessKey, secretKey string) *s3.S3 {
 	// 设置 AWS 访问凭证
-	accessKey := "root"
-	secretKey := "suninfo@123"
-	end_point := "https://192.168.216.231:44086" //endpoint设置，不要动
-
-	// 创建自定义的HTTP客户端并加载自签名证书
+	// 创建自定义的HTTP客户端并跳过证书验证
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // 跳过证书验证
@@ -65,7 +61,7 @@ func createAWSClient() *s3.S3 {
 	// 创建 AWS Session
 	sess, err := session.NewSession(&aws.Config{
 		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, ""),
-		Endpoint:         aws.String(end_point),
+		Endpoint:         aws.String(endpoint),
 		Region:           aws.String("test"),
 		DisableSSL:       aws.Bool(false),
 		S3ForcePathStyle: aws.Bool(true),
@@ -89,8 +85,11 @@ func main() {
 
 	extractCmd := parser.NewCommand("extract", "extract xbstream archive")
 	extractFile := extractCmd.File("i", "input", os.O_RDONLY, 0600, &argparse.Options{})
-	extractOut := extractCmd.String("o", "output", &argparse.Options{})
-	bucketName := extractCmd.String("b", "s3-bucket", &argparse.Options{})
+	extractOut := extractCmd.String("o", "output", &argparse.Options{Required: true})
+	bucketName := extractCmd.String("b", "s3-bucket", &argparse.Options{Required: true})
+	endpoint := extractCmd.String("p", "s3-endpoint", &argparse.Options{Required: true})
+	accessKey := extractCmd.String("u", "s3-access-key", &argparse.Options{Required: true})
+	secretKey := extractCmd.String("k", "s3-secret-key", &argparse.Options{Required: true})
 
 	if err := parser.Parse(os.Args); err != nil {
 		log.Fatal(err)
@@ -99,11 +98,11 @@ func main() {
 	if createCmd.Happened() {
 		writeStream(createFile, createList)
 	} else if extractCmd.Happened() {
-		readStream(extractFile, *bucketName, *extractOut)
+		readStream(extractFile, *endpoint, *accessKey, *secretKey, *bucketName, *extractOut)
 	}
 }
 
-func readStream(file *os.File, bucketName string, output string) {
+func readStream(file *os.File, endpoint, accessKey, secretKey, bucketName string, output string) {
 	var err error
 
 	if *file == (os.File{}) {
@@ -117,7 +116,7 @@ func readStream(file *os.File, bucketName string, output string) {
 		}
 	}
 
-	svc := createAWSClient()
+	svc := createAWSClient(endpoint, accessKey, secretKey)
 	r := xbstream.NewReader(file)
 
 	files := make(map[string]*UPLoad)
