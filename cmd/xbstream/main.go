@@ -20,20 +20,64 @@
 package main
 
 import (
-	"encoding/binary"
-	"hash/crc32"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/akamensky/argparse"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/skmcgrail/go-xbstream/xbstream"
 )
 
+type UPLoad struct {
+	uploadID string
+	partNum  int64
+}
+
 func init() {
 	log.SetOutput(os.Stderr)
+}
+
+func createAWSClient() *s3.S3 {
+	// 设置 AWS 访问凭证
+	accessKey := "root"
+	secretKey := "suninfo@123"
+	end_point := "https://192.168.216.231:44086" //endpoint设置，不要动
+
+	// 创建自定义的HTTP客户端并加载自签名证书
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // 跳过证书验证
+		},
+	}
+	// 创建 AWS Session
+	sess, err := session.NewSession(&aws.Config{
+		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, ""),
+		Endpoint:         aws.String(end_point),
+		Region:           aws.String("test"),
+		DisableSSL:       aws.Bool(false),
+		S3ForcePathStyle: aws.Bool(true),
+		HTTPClient:       httpClient,
+	})
+	if err != nil {
+		log.Fatal("Error creating session:", err)
+	}
+
+	// 创建 S3 服务客户端
+	svc := s3.New(sess)
+	return svc
 }
 
 func main() {
@@ -46,6 +90,7 @@ func main() {
 	extractCmd := parser.NewCommand("extract", "extract xbstream archive")
 	extractFile := extractCmd.File("i", "input", os.O_RDONLY, 0600, &argparse.Options{})
 	extractOut := extractCmd.String("o", "output", &argparse.Options{})
+	bucketName := extractCmd.String("b", "s3-bucket", &argparse.Options{})
 
 	if err := parser.Parse(os.Args); err != nil {
 		log.Fatal(err)
@@ -54,11 +99,11 @@ func main() {
 	if createCmd.Happened() {
 		writeStream(createFile, createList)
 	} else if extractCmd.Happened() {
-		readStream(extractFile, *extractOut)
+		readStream(extractFile, *bucketName, *extractOut)
 	}
 }
 
-func readStream(file *os.File, output string) {
+func readStream(file *os.File, bucketName string, output string) {
 	var err error
 
 	if *file == (os.File{}) {
@@ -72,15 +117,12 @@ func readStream(file *os.File, output string) {
 		}
 	}
 
-	if err = os.MkdirAll(output, 0777); err != nil {
-		log.Fatal(err)
-	}
-
+	svc := createAWSClient()
 	r := xbstream.NewReader(file)
 
-	files := make(map[string]*os.File)
+	files := make(map[string]*UPLoad)
 
-	var f *os.File
+	var fileUpload *UPLoad
 	var ok bool
 
 	for {
@@ -94,41 +136,69 @@ func readStream(file *os.File, output string) {
 		}
 
 		fPath := string(chunk.Path)
+		newFPath := filepath.Join(output, fPath)
+		if fileUpload, ok = files[fPath]; !ok {
+			// 初始化分片上传
+			ctx := context.Background()
+			initResp, err := svc.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(newFPath),
+			}, func(r *request.Request) {
+				r.HTTPRequest.Header.Set("Object-Patch", strconv.FormatBool(true))
+			})
 
-		if f, ok = files[fPath]; !ok {
-			newFPath := filepath.Join(output, fPath)
-			if err = os.MkdirAll(filepath.Dir(newFPath), 0777); err != nil {
-				log.Fatal(err)
-				break
-			}
-
-			f, err = os.OpenFile(newFPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
 			if err != nil {
-				log.Fatal(err)
-				break
+				log.Fatal("Error initializing multipart upload:", err)
 			}
-			files[fPath] = f
+			fileUpload = &UPLoad{
+				uploadID: *initResp.UploadId,
+				partNum:  1,
+			}
+			files[fPath] = fileUpload
 		}
 
 		if chunk.Type == xbstream.ChunkTypeEOF {
-			f.Close()
+			// 完成分片上传
+			_, err = svc.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(bucketName),
+				Key:      aws.String(newFPath),
+				UploadId: &fileUpload.uploadID,
+			})
+			if err != nil {
+				log.Fatal("Error completing multipart upload:", err)
+			}
+			delete(files, fPath)
 			continue
 		}
 
-		crc32Hash := crc32.NewIEEE()
-
-		tReader := io.TeeReader(chunk, crc32Hash)
-
-		f.Seek(int64(chunk.PayOffset), io.SeekStart)
-		if _, err = io.Copy(f, tReader); err != nil {
-			log.Fatal(err)
-			break
+		// crc32Hash := crc32.NewIEEE()
+		// log.Printf("fPath:%s,chunk.PayLen:%d,chunk.PayOffset:%d\n", fPath, chunk.PayLen, chunk.PayOffset)
+		// tReader := io.TeeReader(chunk, crc32Hash)
+		partBuffer := make([]byte, chunk.PayLen)
+		_, err = io.ReadFull(chunk.Reader, partBuffer)
+		if err != nil {
+			fmt.Println("read:", err)
+			return
 		}
-
-		if chunk.Checksum != binary.BigEndian.Uint32(crc32Hash.Sum(nil)) {
-			log.Fatal("chunk checksum did not match")
-			break
+		_, err = svc.UploadPart(&s3.UploadPartInput{
+			Body:          aws.ReadSeekCloser(bytes.NewReader(partBuffer)),
+			Bucket:        aws.String(bucketName),
+			Key:           aws.String(newFPath),
+			UploadId:      &fileUpload.uploadID,
+			PartNumber:    aws.Int64(fileUpload.partNum),
+			ContentLength: aws.Int64(int64(chunk.PayLen)),
+			OffSet:        aws.Int64(int64(chunk.PayOffset)),
+		})
+		if err != nil {
+			log.Fatal("Error uploading part:", err)
+			return
 		}
+		fileUpload.partNum++
+
+		// if chunk.Checksum != binary.BigEndian.Uint32(crc32Hash.Sum(nil)) {
+		// 	log.Fatal("chunk checksum did not match")
+		// 	break
+		// }
 	}
 }
 
